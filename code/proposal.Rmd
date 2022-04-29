@@ -1,0 +1,391 @@
+---
+title: "Proposal"
+author: "Mengyu Li"
+date: "2022/3/12"
+output: html_document
+---
+```{r setup, include = FALSE}
+# knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+```{r, include = FALSE}
+rm(list = ls(all = TRUE))
+setwd("D:/Jupyter/scRNA")
+memory.limit(5e+11)
+```
+
+# Introduction
+## Background
+Cellular reprogramming has become a fundamental topic in medical and biological research. Understanding the reprogramming mechanism that guides de-differentiation during development is a major challenge, which requires researchers to answer questions such as: 
+
+* What classes of cells are present at each stage? 
+
+* What was their origin at earlier stages? What are their likely fates at later stages? 
+
+* What regulatory programs (e.g., transcription factors) control their dynamics?
+
+The first challenge has been largely solved by the advent of single-cell RNA sequencing (scRNA-seq), while the others remain work-in-progress. 
+
+## Our work
+In this project, we aim to address the second question by analyzing a scRNA-seq dataset collected across 18 days of reprogramming mouse embryonic fibroblasts (MEFs) into induced pluripotent stem cells (iPSCs). 
+Our goal is to infer cell trajectories during reprogramming. Specifically, the question of interest is: *given a cell at one time point, where will its descendants be at a later time point, and where are its ancestors at an earlier time point?*
+
+In addition, scRNA-seq datasets often contain millions of genes and cells, so the computation is always time-consuming. Thus, we also aim to develop an efficient computational tool to alleviate the computational burden.
+
+# Data Preparation
+We consider a scRNA-seq dataset (Schiebinger et al. 2019) profiled 251,203 cells, collected at 39 time points across 18 days, with samples taken every 12h (every 6h between days 8 and 9).
+The dataset is publicly available with the accession code GSE122662 in Gene Expression Omnibus.
+
+## Data Read-in and Description
+
+```{r}
+library(Seurat)
+library(SeuratDisk)
+library(Matrix)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(transport)
+library(pracma)
+```
+
+Considering the memory constraint, we randomly select 10% cells to obtain the `anndata_subset.h5ad`. Then, we convert it into a Seurat object.
+
+```{r}
+Convert("data/anndata_subset.h5ad", "data/anndata_subset.h5seurat")
+seuratObject = LoadH5Seurat("data/anndata_subset.h5Seurat")
+seuratObject = CreateSeuratObject(seuratObject[["RNA"]]@counts, 
+                                  meta.data = seuratObject@meta.data)
+seuratObject
+```
+
+The `seuratObject` consists of two parts:
+
+* `counts`: a $19,089 \times 25,120$ reads count matrix (of class "dgCMatrix"), where rows are genes, columns represent cells, and the $(i,j)$-th component is the observed expression level of the gene $i$ in cell $j$. The values have been log-normalized.  
+
+* `meta.data`: a $25,120 \times 6$ data frame, that contains annotation of cells.
+
+  + `orig.ident`: contains the sample identity if known.
+  
+  + `nCount_RNA`: counts per cell.
+  
+  + `nFeature_RNA`: genes detected per cell.
+  
+  + `day`: sampled time.
+  
+  + `x` and `y`: force-directed layout embedding (FLE) coordinates in 2D.
+
+```{r}
+counts = seuratObject[["RNA"]]@counts
+dim(counts)
+head(counts[,1:3])
+metadata = seuratObject@meta.data
+dim(metadata)
+head(metadata)
+tail(metadata)
+```
+
+## Data Preprocessing
+
+In this subsection, we conduct the quality control analysis by **cell-level filtering** and **gene-level filtering**.
+
+To begin with, we add a logical variable `iPSC` to label whether a cell is a iPSC.
+
+```{r}
+metadata = mutate(metadata, iPSC = (orig.ident == "DiPSC"))
+seuratObject@meta.data = metadata
+group_by(metadata, iPSC) %>% summarize()
+
+ggplot(metadata, aes(x = iPSC, fill = iPSC)) + 
+  geom_bar() +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("No. of cells")
+```
+
+### Cell-level Filtering
+
+We use the box-plot and density plot to visualize the distribution of **counts** and the **number of genes** per cell.
+
+```{r}
+p1 = ggplot(metadata, aes(x = iPSC, y = nCount_RNA, fill = iPSC)) + 
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(name = "counts") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Counts")
+
+p2 = ggplot(metadata, aes(x = nCount_RNA, fill = iPSC)) + 
+  geom_density(alpha = 0.4) +
+  scale_x_continuous(name = "counts") +
+  geom_vline(xintercept = 1000) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Counts")
+
+p3 = ggplot(metadata, aes(x = iPSC, y = nFeature_RNA, fill = iPSC)) + 
+  geom_boxplot(alpha = 0.8) +
+  scale_y_continuous(name = "number of genes") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("No. of genes")
+
+p4 = ggplot(metadata, aes(x = nFeature_RNA, fill = iPSC)) + 
+  geom_density(alpha = 0.4) +
+  scale_x_continuous(name = "number of genes") +
+  geom_vline(xintercept = 300) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("No. of genes")
+
+ggarrange(p1, p2, nrow = 1, common.legend = FALSE)
+ggarrange(p3, p4, nrow = 1, common.legend = FALSE)
+```
+
+We also use the scatter plot to visualize the relationship between `nFeature_RNA` and `nCount_RNA`, and detect whether there exist a large number of cells with low-level gene expression.
+
+```{r}
+ggplot(metadata, aes(x = nCount_RNA, y = nFeature_RNA, color = day)) + 
+  geom_point(alpha = 0.3) + 
+  stat_smooth(method = lm, color = "red") +
+  scale_x_continuous(name = "counts") +
+  scale_y_log10(name = "number of genes") +
+  geom_vline(xintercept = 1000) +
+  geom_hline(yintercept = 300) +
+  facet_wrap(~iPSC) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("No. of genes v.s. Counts")
+```
+
+Cells with poor quality are likely to have low genes and counts per cell, and correspond to the data points in the bottom left quadrant of the plot above. Good cells generally exhibit both higher number of genes per cell and higher counts value.
+
+As shown in the figure above, several cells in the last few days are of poor quality.
+After comprehensive consideration, we use the following thresholds to filter cells:
+
+* `nCount_RNA` >= 1000;
+
+* `nFeature_RNA` >= 300.
+
+```{r}
+filtered_seurat = subset(seuratObject, 
+                         subset = (nCount_RNA >= 1000) & (nFeature_RNA >= 300))
+filtered_seurat
+```
+We can observe that $25,120-25,099=21$ cells has been filtered out.
+
+### Gene-level Filtering
+For the gene-level, we keep only genes which are expressed in 10 or more cells.
+
+```{r}
+counts = filtered_seurat[["RNA"]]@counts
+nonzero = (counts > 0)  # logical variable
+keep_genes = (rowSums(nonzero) >= 10)  # logical variable
+summary(keep_genes)
+
+filtered_counts = counts[keep_genes, ]
+filtered_seurat = CreateSeuratObject(filtered_counts, meta.data = filtered_seurat@meta.data)
+filtered_seurat
+```
+
+# Exploratory Data Analysis
+
+## Dimension Reduction
+First, we select highly variable genes by using the `mean.var.plot` method in Seurat. Specifically, it works as follows:
+
+* First, divide genes into 20 bins based on their average expression levels across all cells;
+
+* Second, compute the Fano factor of gene expression in each bin and then normalize it. The Fano factor, defined as the variance divided by the mean, is a measure of dispersion. 
+
+* Finally, obtain a set of 631 variable genes by thresholding the normalized dispersion at 1.0.
+
+```{r}
+filtered_seurat = FindVariableFeatures(filtered_seurat, selection.method = "mean.var.plot")
+top10 = head(VariableFeatures(filtered_seurat), 10)
+plot = VariableFeaturePlot(filtered_seurat)
+LabelPoints(plot = plot, points = top10, repel = TRUE)
+```
+
+We only keep these 631 highly variable genes.
+
+```{r}
+filtered_seurat = subset(filtered_seurat, features = VariableFeatures(filtered_seurat))
+filtered_seurat
+```
+
+
+Next, we utilize the principal component analysis to further reduce data dimensions.
+
+```{r}
+counts = filtered_seurat[["RNA"]]@counts
+counts = t(as.matrix(counts))
+counts_pca = prcomp(counts)
+
+screeplot(counts_pca, type = "l", npcs = 30, main = "Screeplot of the first 25 PCs")
+abline(h = 1, col = "red", lty = 5)
+legend("topright", legend = c("Eigenvalue = 1"), col=c("red"), lty = 5)
+
+cumpro = cumsum(counts_pca$sdev^2 / sum(counts_pca$sdev^2))
+plot(cumpro[0:25], xlab = "PC #", ylab = "Amount of explained variance", main = "Cumulative variance plot")
+abline(v = 22, col = "blue", lty = 5)
+abline(h = 0.503942, col = "blue", lty = 5)
+legend("bottomright", legend = c("Cut-off @ PC22"), col = "blue", lty = 5)
+```
+
+We notice that the eigenvalues of the first 22 principal components are greater than 1, which explain more than 50% of variance. Therefore, we chose to reduce the dimension from 631 to 22.
+
+```{r}
+counts_pc = counts_pca$x[,1:22]
+```
+
+## Data Visualization
+
+For brevity, we rename `nCount_RNA` and `nFeature_RNA` as `nCount` and `nGene`, respectively.
+
+```{r}
+metadata = rename(filtered_seurat@meta.data, nCount = nCount_RNA, nGene = nFeature_RNA)
+filtered_seurat@meta.data = metadata
+head(metadata)
+```
+
+Considering that our goal is to research cellular developmental paths during a period of time, we plot the values of `nCount` and `nGene` across time for a general grasp.
+
+```{r}
+p1 = ggplot(metadata, aes(x = reorder(orig.ident, day), y = nCount, color = reorder(orig.ident, day))) + 
+  geom_point(na.rm = TRUE) +
+  geom_jitter(alpha = 0.1) +
+  scale_x_discrete(name = "time points") +
+  scale_y_continuous(name = "counts") +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position = "none") +
+  ggtitle("Counts vs. Times")
+
+p2 = ggplot(metadata, aes(x = reorder(orig.ident, day), y = nGene, color = reorder(orig.ident, day))) + 
+  geom_point(na.rm = TRUE) +
+  geom_jitter(alpha = 0.1) +
+  scale_x_discrete(name = "time points") +
+  scale_y_continuous(name = "no. of genes") +
+  theme(axis.text.x = element_text(angle = 60, vjust = 1, hjust = 1)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position = "none") +
+  ggtitle("No. of genes vs. Times")
+
+ggarrange(p1, p2, nrow = 2)
+```
+
+We can observe that the cells were collected at 39 time points across 18 days, with samples taken every 12h (every 6h between days 8 and 9), which is consistent with the data description.
+
+
+Then, we use the force-directed layout embedding (FLE) technique to visualize the high-dimensional expression matrix in 2D. 
+FLE (Jacomy et al., 2014) is large-scale graph visualization tool which simulates the evolution of a physical system in which connected nodes experience attractive forces, but unconnected nodes experience repulsive forces. It better captures global structures than tSNE and UMAP, etc.
+
+```{r}
+ggplot(metadata, aes(x = x, y = y, color = day)) + 
+  geom_point(alpha = 0.3) +
+  theme_classic() +
+  labs(x = NULL, y = NULL) +
+  theme(axis.line = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank())
+```
+
+
+# Preliminary Model-based Analysis
+
+## Mathematical Formulation
+We model the differentiating population of cells as a stochastic process on the high-dimensional expression space. To infer how the differentiation process evolves over time, we need to compute the joint distribution of cells between different pairs of time points. 
+
+A set of cells at the time point $t$ is defined as $\mathbf{X}(t)=(\mathbf{x}_1(t),\ldots,\mathbf{x}_{n(t)}(t))\in \mathbb{R}^{{n(t)} \times d}$, where $\mathbf{x}_i(t) \in \mathbb{R}^{d}, 1\le i\le n(t)$ denotes an individual cell in the $d$-dimensional gene expression space.
+
+For each pair of adjacent time points $(t_k,t_{k+1})$, we compute a transport matrix $\mathbf{T}_{t_k,t_{k+1}}$ connecting cells $\mathbf{X}(t_k) = (\mathbf{x}_1(t_i),\ldots,\mathbf{x}_{n(t_k)}(t_k))$ at time $t_k$ to cells $\mathbf{Y}(t_{k+1}) = (\mathbf{y}_1(t_{k+1}),\ldots,\mathbf{y}_{n(t_{k+1})}(t_{k+1}))$ at time $t_{k+1}$. 
+To compute $\mathbf{T}_{t_k,t_{k+1}}$, we define empirical probability distributions $\mathbf{a} \in \mathbb{R}^{{n(t_{k})}}$ and $\mathbf{b} \in \mathbb{R}^{{n(t_{k+1})}}$ for cells in $\mathbf{X}(t_k)$ and $\mathbf{Y}(t_{k+1})$, respectively.
+Then, $\mathbf{T}_{t_k,t_{k+1}}$ can be solved by minimizing the total transport cost 
+$$
+\min _{\mathbf{T} \in \mathbb{R}_{+}^{n(t_k) \times n(t_{k+1})}, \mathbf{T} \mathbf{1} = \mathbf{a}, \mathbf{T}^{\top} \mathbf{1} = \mathbf{b}} \langle \mathbf{T}, \mathbf{C}\rangle := \sum_{i,j} T_{i j} C_{i j},
+$$
+where $\mathbf{C}$ is a given cost matrix usually defined by pairwise Euclidean distance, i.e., $C_{ij} = \|\mathbf{x}_{i}(t_k) - \mathbf{y}_{j}(t_{k+1})\|_2$. 
+For modeling cellular proliferation (e.g., cells growth and death), the strict constraints on marginals can be relaxed to soft constraints, giving rise to the unbalanced transport problem
+$$
+\min _{\mathbf{T} \in \mathbb{R}_{+}^{n(t_k) \times n(t_{k+1})}} \langle \mathbf{T}, \mathbf{C}\rangle + \lambda_1 \mathcal{K L}(\mathbf{T} \mathbf{1} \| \mathbf{a}) + \lambda_2 \mathcal{K L} (\mathbf{T}^{\top} \mathbf{1} \| \mathbf{b}).
+$$
+Then, we use the transport matrix $\mathbf{T}_{t_k,t_{k+1}}$ as an estimate of the true temporal coupling $\pi_{t_k,t_{k+1}}$.
+
+![transport_matrix](transport_matrix.png)
+
+After having computed transport matrices and used them to estimate the temporal couplings between adjacent time points, we next infer transitions over a longer time interval $(t_i,t_j)$. To do this, we assume the developmental stochastic process is Markov. Therefore, we can infer long-range transitions by composing transport maps as follows:
+$$
+\pi_{t_{i}, t_{j}} = \pi_{t_{i}, t_{i+1}} \circ \pi_{t_{i+1}, t_{i+2}} \circ \cdots \circ \pi_{t_{j-1}, t_{j}} \approx \mathbf{T}_{t_{i}, t_{i+1}} \circ \mathbf{T}_{t_{i+1}, t_{i+2}} \circ \cdots \circ \mathbf{T}_{t_{j-1}, t_{j}}.
+$$
+Here $\circ$ denotes the matrix multiplication.
+
+![long_term_transport](long_term_transport.png)
+
+In this way, the development trajectories of cells in reprogramming can be identified.
+
+## Computing transport matrices
+We compute the transport matrix between adjacent time points, D5 and D5.5, for example. To begin with, we define source and target measures `a`, `b`, and source and target supports `xs`, `xt`. Then, we compute the cost matrix `C` between `xs` and `xt`.
+
+```{r}
+df = bind_cols(metadata, counts_pc)
+xs = filter(df, day == 5) %>% select(PC1:PC22)  # source supports
+xt = filter(df, day == 5.5) %>% select(PC1:PC22)  # target supports
+n1 = dim(xs)[1]
+n2 = dim(xt)[1]
+a = rep(1, n1)/n1  # source measures
+b = rep(1, n2)/n2  # target measures
+C = distmat(as.matrix(xs), as.matrix(xt))  # cost matrix (Euclidean distance)
+```
+
+Based on `a`, `b` and `C`, we solve the OT problem and obtain the transport matrix `tran_mat`.
+
+```{r}
+tran_res = transport(a, b, costm = C)  # optimal transport plan (in data.frame)
+head(tran_res)
+tran_mat = matrix(0, n1, n2)  # optimal transport plan  (in matrix)
+tran_mat[cbind(tran_res$from,tran_res$to)] = tran_res$mass
+```
+
+We use the heatmap to illustrate the transport between the first 200 points of sources and targets.
+```{r}
+image(tran_mat[1:200,1:200], axes = FALSE)
+```
+
+We also plot lines between source and target 2D samples with alpha values proportional to the values of transport matrix.
+
+```{r}
+p1 = ggplot(filter(metadata, day == 5 | day == 5.5), aes(x = x, y = y, color = orig.ident)) + 
+  geom_point(alpha = 0.5) +
+  theme_classic() +
+  labs(x = NULL, y = NULL) +
+  theme(axis.line = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank()) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  ggtitle("Transport between D5 & D5.5 cells")
+
+xs_2d = filter(df, day == 5) %>% select(x:y)
+xt_2d = filter(df, day == 5.5) %>% select(x:y)
+
+p1 + geom_segment(data=tibble(), 
+                  aes(x = xs_2d[tran_res[,1],1], 
+                      y = xs_2d[tran_res[,1],2], 
+                      xend = xt_2d[tran_res[,2],1], 
+                      yend = xt_2d[tran_res[,2],2]), 
+                  alpha = tran_res[,3]/max(tran_res[,3])/3, color = "red")
+
+```
+
+# Future Plan
+## Model
+* Inferring long-range temporal couplings.
+  + Taking into account the growth rate and death rate of cells.
+* Interpreting: ancestors, descendants, and trajectories.
+
+## Computation
+Unfortunately, the computational complexity of solving optimal transport problems is of the order $O(n^3\log n)$, which greatly hinders its application in large-scale scRNA-seq datasets. Thus, we aim to use some statistical techniques (e.g., element-wise subsampling) to accelerate existing computing methods.
+
+
+
+# Reference
+
+1. Schiebinger, G., Shu, J., Tabaka, M., Cleary, B., Subramanian, V., Solomon, A., ... & Lander, E. S. (2019). Optimal-transport analysis of single-cell gene expression identifies developmental trajectories in reprogramming. Cell, 176(4), 928-943.
+
+2. Jacomy, M., Venturini, T., Heymann, S., & Bastian, M. (2014). ForceAtlas2, a continuous graph layout algorithm for handy network visualization designed for the Gephi software. PloS one, 9(6), e98679.
+
+3. Zhang, J., Zhong, W., & Ma, P. (2021). A review on modern computational optimal transport methods with applications in biomedical research. Modern Statistical Methods for Health Research, 279-300.
+
